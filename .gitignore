@@ -1,0 +1,46 @@
+# Never commit owner account files or generated local credentials.
+accounts*.txt
+account*.txt
+credentials*.txt
+*.auth.json
+pool.enc.json
+master.key
+*.enc.json
+.env
+.env.*
+*.secret
+*.secrets
+# 发版用的 GitHub token：只放本机，永远不要提交
+.magpie-gptpool-release-token
+*.release-token
+*.token
+
+# 维护者本机工具：发版 / 部署 / 上游追踪脚本不进公开仓库。
+# 它们会碰到主机名、跳板别名、远程路径，公开一次就永久留在 git 历史里。
+# 仓库里只留 scripts/demo-preview.mjs（造假数据截图用，不含任何内网信息）。
+scripts/release.sh
+scripts/update-server.sh
+scripts/upstream-status.sh
+scripts/deploy-local.sh
+scripts/.release-token
+.magpie-gptpool-release.env
+*.release.env
+
+# Runtime, package archives, and tests
+node_modules/
+*.tgz
+playwright-report/
+test-results/
+*.log
+.DS_Store
+__pycache__/
+*.pyc
+# 本地助手工作目录（截图脚本产物、笔记），不进仓库
+.workbuddy-ai/
+
+# Local account exports and encrypted vault state
+卡密导出*.txt
+*.rt
+.env
+master.key
+gui-sessions.json

@@ -1,0 +1,1592 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { createGuiService, GUI_PORT, startGuiServer, stopGuiServer } from "../lib/gui-service.mjs";
+import { createInMemoryStatsStore, recordImageCall, recordQuotaCheck } from "../lib/pool-stats.mjs";
+import { IMAGE_ERROR_LOG_MAX_LIMIT, appendImageErrorLog } from "../lib/image-error-log.mjs";
+import { accountSlotTag, formatAccountSlotLabel } from "../lib/pool-connection.mjs";
+import { clearRequestLog, recordRequest } from "../lib/request-log.mjs";
+import { clearPoolEvents } from "../lib/pool-events.mjs";
+import { newBatchId, recordBatch } from "../lib/batch-registry.mjs";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { createServer } from "node:net";
+import { join } from "node:path";
+import { GPTFreeGuiPlugin } from "../index.mjs";
+
+const seed = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+const future = () => [
+  Buffer.from('{"alg":"RS256"}').toString("base64url"),
+  Buffer.from(JSON.stringify({ exp: Math.floor(Date.now()/1000) + 3600 })).toString("base64url"),
+  "signature",
+].join(".");
+
+async function harness(options = {}) {
+  const service = createGuiService({ port: 0, ...options });
+  const addr = await service.listen();
+  const base = "http://127.0.0.1:" + addr.port + "/";
+  const entry = await fetch(base + "ui");
+  assert.equal(entry.status, 200);
+  const html = await entry.text();
+  const token = html.match(/meta name="gptfree-session" content="([0-9a-f]{64})"/)?.[1];
+  assert(token, "server creates an unpredictable page-session capability");
+  const api = async (route, body, { bearer = token, origin = "null", contentType = true } = {}) => {
+    const headers = { Origin: origin, "X-GPTFree-Session": bearer };
+    if (body !== undefined && contentType) headers["Content-Type"] = "application/json";
+    const r = await fetch(base + "api/" + route, {
+      method: body === undefined ? "GET" : "POST", headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: r.status, json: await r.json() };
+  };
+  return { service, base, html, token, api, close: async () => service.close() };
+}
+
+test("connection test is manual and authenticated, with a single read-only upstream probe", async () => {
+  const token = future();
+  const statusCases = [
+    [() => Response.json({ private: "must-not-leak" }), "authorized", 200],
+    [() => new Response("gateway page"), "upstream_error", 200],
+    [() => new Response(null, { status: 401 }), "unauthorized", 401],
+    [() => new Response(null, { status: 429 }), "rate_limited", 429],
+    [() => new Response(null, { status: 503 }), "upstream_error", 503],
+    [() => { throw new Error("private network details"); }, "network_error", undefined],
+  ];
+  const calls = [];
+  let rows = [{ email: "synthetic@example.test", accessToken: token }];
+  let reply;
+  const h = await harness({ poolRead: async () => rows, connectionFetcher: async (url, init) => {
+    calls.push({ url, init });
+    return reply();
+  } });
+  try {
+    assert.match(h.html, /id="testConnection"/);
+    assert.equal((await h.api("connection-test")).status, 405);
+    assert.equal((await h.api("connection-test", {}, { bearer: "invalid" })).status, 403);
+    assert.equal((await h.api("connection-test", {}, { origin: "https://site.invalid" })).status, 403);
+    assert.equal((await h.api("connection-test", { url: "https://site.invalid" })).status, 400);
+    assert.equal(calls.length, 0);
+    for (const [makeResponse, state, status] of statusCases) {
+      reply = makeResponse;
+      const { json, status: localStatus } = await h.api("connection-test", {});
+      assert.equal(localStatus, 200);
+      assert.equal(json.mode, "codex_sample");
+      assert.equal(json.state, state);
+      assert.equal(json.status, status);
+      assert.doesNotMatch(JSON.stringify(json), /must-not-leak|private|synthetic|signature/);
+    }
+    assert.equal(calls.length, statusCases.length);
+    for (const { url, init } of calls) {
+      assert.equal(url, "https://chatgpt.com/backend-api/wham/usage");
+      assert.equal(init.method, "GET");
+      assert.equal(init.redirect, "error");
+      assert.equal(new Headers(init.headers).get("authorization"), "Bearer " + token);
+      assert.ok(init.signal instanceof AbortSignal);
+    }
+    rows = [];
+    reply = () => new Response(null, { status: 401 });
+    const anonymous = await h.api("connection-test", {});
+    assert.equal(anonymous.json.mode, "network_only");
+    assert.equal(anonymous.json.state, "reachable");
+    assert.equal(new Headers(calls.at(-1).init.headers).has("authorization"), false);
+  } finally { await h.close(); }
+});
+
+test("tab panels are siblings, never nested (balanced <section> tags)", async () => {
+  const html = await readFile(new URL("../gui/dashboard.html", import.meta.url), "utf8");
+  const opens = (html.match(/<section\b/g) || []).length;
+  const closes = (html.match(/<\/section>/g) || []).length;
+  assert.equal(opens, closes, "section 开闭必须配对");
+  // 嵌套会让后一个面板变成前一个的子节点：前一个是 hidden 时，点它的页签就是一片空白。
+  // 0.12.7 就是这么坏的 —— 日志面板漏了一个 </section>，设置页整块被吞进隐藏的日志面板。
+  for (const match of html.matchAll(/<section id="(\w+)"[^>]*>/g)) {
+    const body = html.slice(match.index + match[0].length, html.indexOf("</section>", match.index));
+    assert(!body.includes("<section"), `${match[1]} 里嵌了另一个 section`);
+  }
+  for (const panel of ["overviewPanel", "livePanel", "imagesPanel", "logsPanel", "settingsPanel", "importPanel"]) {
+    assert(html.includes(`id="${panel}"`), `缺少面板 ${panel}`);
+  }
+});
+
+test("Magpie GUI manifest points to a real page, provider menu action and a loopback service", async () => {
+  const pkg = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(pkg.magpie.name, "GPT 号池");
+  assert.equal(pkg.magpie.page.title, "GPT 号池");
+  assert.equal(pkg.magpie.page.titles.zh, "GPT 号池");
+  assert.equal(pkg.magpie.page.file, "gui/entry.html");
+  assert.equal(pkg.magpie.page.service.port, GUI_PORT);
+  assert.equal(pkg.magpie.actions[0].id, "batch-import");
+  assert.equal(pkg.magpie.actions[0].menu, "provider");
+  assert.equal(pkg.magpie.actions[0].titles.zh, "打开 GPT 号池");
+  assert(pkg.files.includes("gui"));
+  assert.equal(typeof GPTFreeGuiPlugin, "function");
+  const page = await readFile(new URL("../gui/entry.html", import.meta.url), "utf8");
+  const entry = await readFile(new URL("../gui/entry.js", import.meta.url), "utf8");
+  assert(page.includes("GPT 号池"));
+  assert(page.includes("_magpie/bridge.js"));
+  assert(entry.includes("magpie.service"));
+  assert(entry.includes("location.replace"));
+});
+
+test("GUI serves a real page with editable RT, JSON and TXT input and no secrets or storage", async () => {
+  const h = await harness();
+  try {
+    assert(h.html.includes("GPT 号池"));
+    assert(h.html.includes("导入账号"));
+    assert.match(h.html, /accept="\.rt,\.json,\.jsonl,\.txt,/);
+    assert(h.html.includes("导入并授权入池"));
+    assert(h.html.includes("skipInvalid"));
+    assert(h.html.includes("poolProxyInput"));
+    assert(h.html.includes("clearPaste"));
+    assert(h.html.includes("refreshAllPool"));
+    assert(h.html.includes("syncProviders"));
+    assert(!h.html.includes(seed));
+    assert(h.html.includes("gptfree-session"));
+    const asset = await fetch(h.base + "assets/app.js");
+    assert.equal(asset.status, 200);
+    const app = await asset.text();
+    assert(app.includes("fileInput"));
+    assert(app.includes("pasteAccounts"));
+    assert(app.includes("checkPaste"));
+    assert(app.includes('$("pasteAccounts").value = text'));
+    assert(!app.includes('$("pasteAccounts").value = ""') || app.includes("clearPaste"));
+    assert(app.includes("accounts/refresh"));
+    assert(app.includes("syncProviders"));
+    assert(app.includes('api("draft")'));
+    assert(app.includes('api("sync"'));
+    assert(!h.html.includes("localStorage"));
+    assert(!app.includes("localStorage"));
+  } finally { await h.close(); }
+});
+
+test("TXT upload parses 3 and 5-col formats with masked rows, not passwords, TOTP or Token", async () => {
+  const h = await harness();
+  const jwt = future();
+  const secretLink = "https://mail.example.store/verysecret123";
+  const txt = [
+    `user1@example.com----supersecret1----${seed}`,
+    `user2@example.com---supersecret2---${seed}---${secretLink}`,
+    `user3@example.com----supersecret3----${seed}----${jwt}`,
+    `user4@example.com----supersecret4----${seed}----${jwt}----rt_never_leaked`,
+    `USER1@example.com----other-secret----${seed}`,
+  ].join("\n");
+  try {
+    const { status, json } = await h.api("preview", { text: txt });
+    assert.equal(status, 200);
+    assert.equal(json.count, 4);
+    assert.equal(json.duplicates, 1);
+    assert.deepEqual(json.rows.map((row) => row.format), ["standard", "mail_link", "access_token", "access_token"]);
+    assert.equal(json.rows[2].tokenState, "unexpired_unverified");
+    for (const value of [seed, jwt, secretLink, "supersecret", "user3@example.com", "rt_never_leaked"])
+      assert(!JSON.stringify(json).includes(value), "secret included: " + value.slice(0, 4));
+  } finally { await h.close(); }
+});
+
+test("GUI requires its page capability and Origin null to reach sensitive endpoints", async () => {
+  const h = await harness();
+  try {
+    assert.equal((await h.api("accounts", undefined, { bearer: "0".repeat(64) })).status, 403);
+    assert.equal((await h.api("accounts", undefined, { origin: "https://attacker.test" })).status, 403);
+    assert.equal((await h.api("accounts/refresh", { all: true }, { bearer: "0".repeat(64) })).status, 403);
+    assert.equal((await h.api("accounts/refresh", { all: true }, { origin: "https://attacker.test" })).status, 403);
+    assert.equal((await h.api("preview", { text: "test@example.com----pass" }, { origin: "https://attacker.test" })).status, 403);
+    assert.equal((await h.api("preview", { text: "test@example.com----pass" }, { contentType: false })).status, 403);
+    const invalid = await h.api("start", { mode: "pool", consent: true });
+    assert.equal(invalid.status, 410);
+    const preflight = await fetch(h.base + "api/preview", {
+      method: "OPTIONS",
+      headers: { Origin: "null", "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "X-GPTFree-Session, Content-Type" },
+    });
+    assert.equal(preflight.status, 204);
+    assert.equal(preflight.headers.get("access-control-allow-origin"), "null");
+  } finally { await h.close(); }
+});
+
+test("GUI rejects strict validation errors unless skipInvalid is opted in and validates proxy", async () => {
+  let seenArgs;
+  const h = await harness({
+    batch: async (args) => {
+      seenArgs = args;
+      args.onProgress({ state: "added", line: 2, email: "us***@example.com" });
+      return { total: 1, added: 1, reused: 0, failed: [], duplicates: 0, invalid: [{ line: 1, reason: "bad" }] };
+    },
+  });
+  try {
+    const txt = `bad-email----pw----${seed}\nuser@example.com----pw----${seed}`;
+    const preview = await h.api("preview", { text: txt });
+    assert.equal(preview.status, 200);
+    assert.equal(preview.json.errors.length, 1);
+    assert.equal((await h.api("start", { mode: "pool", consent: true })).status, 422);
+    assert.equal((await h.api("start", { mode: "pool", consent: true, skipInvalid: true, proxy: "http://u:p@127.0.0.1:7890" })).status, 400);
+    const skipped = await h.api("start", { mode: "pool", consent: true, skipInvalid: true, proxy: "http://127.0.0.1:7890" });
+    assert.equal(skipped.status, 202);
+    for (let i = 0; i < 20; i++) {
+      const st = (await h.api("status")).json;
+      if (st.state === "completed") break;
+      await new Promise((r) => setTimeout(r, 15));
+    }
+    assert.equal(seenArgs.skipInvalid, true);
+    assert.equal(seenArgs.proxy, "http://127.0.0.1:7890");
+    const fixed = await h.api("preview", { text: `user@example.com----pw----${seed}` });
+    assert.equal(fixed.status, 200);
+    assert.equal((await h.api("start", { mode: "pool", consent: false })).status, 403);
+  } finally { await h.close(); }
+});
+
+test("GUI starts a background batch, polls progress and never writes raw TXT to HTML response", async () => {
+  let requestMode, seenRaw, runs = 0;
+  const h = await harness({
+    batch: async (args) => {
+      runs++;
+      requestMode = args.mode;
+      seenRaw = await args.read();
+      args.onProgress({ state: "authorizing", line: 1, email: "us***@example.com" });
+      args.onProgress({ state: "token_reused", line: 1, email: "us***@example.com" });
+      return { total: 1, added: 1, reused: 1, failed: [], duplicates: 0 };
+    },
+    poolRead: async () => [],
+  });
+  try {
+    const txt = `user@example.com----super-secret-password----${seed}----${future()}`;
+    await h.api("preview", { text: txt });
+    const started = await h.api("start", { mode: "pool", consent: true });
+    assert.equal(started.status, 202);
+    assert.equal(started.json.state, "running");
+    let state;
+    for (let i = 0; i < 20; i++) {
+      state = (await h.api("status")).json;
+      if (state.state === "completed") break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.equal(state.state, "completed");
+    assert.equal(state.result.added, 1);
+    assert.equal(state.result.reused, 1);
+    assert.equal(state.events.at(-1).state, "token_reused");
+    assert.equal(runs, 1);
+    assert.equal(requestMode, "pool");
+    assert.equal(seenRaw, txt);
+    for (const value of ["super-secret-password", seed, future().slice(0, 10)]) {
+      assert(!JSON.stringify(state).includes(value));
+      assert(!JSON.stringify(started.json).includes(value));
+    }
+  } finally { await h.close(); }
+});
+
+test("GUI cancel aborts an import without disclosing sensitive data", async () => {
+  let observedAbort = false;
+  const h = await harness({
+    batch: async (args) => {
+      await new Promise((resolve) => {
+        if (args.signal.aborted) { observedAbort = true; resolve(); return; }
+        args.signal.addEventListener("abort", () => { observedAbort = true; resolve(); }, { once: true });
+      });
+      throw new Error("token: sensitive error must not leak");
+    },
+  });
+  try {
+    await h.api("preview", { text: `user@example.com----secret----${seed}` });
+    assert.equal((await h.api("start", { mode: "pool", consent: true })).status, 202);
+    assert.equal((await h.api("cancel", {})).status, 200);
+    let state;
+    for (let i = 0; i < 20; i++) {
+      state = (await h.api("status")).json;
+      if (state.state === "canceled") break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.equal(observedAbort, true);
+    assert.equal(state.state, "canceled");
+    assert(!JSON.stringify(state).includes("sensitive"));
+  } finally { await h.close(); }
+});
+
+test("GUI lists, refreshes and removes accounts using opaque ids, not raw emails or tokens", async () => {
+  const records = [
+    { email: "alice@example.com", accessToken: future(), totp: seed, password: "s" },
+    { email: "bob@example.com", accessToken: "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJleHAiOjF9.sig", totp: seed, password: "s2" },
+  ];
+  let removed;
+  let syncCalls = 0;
+  const h = await harness({
+    poolRead: async () => records,
+    poolRemove: async (email) => { removed = email; },
+    onPoolChange: async () => { syncCalls++; return { connected: true }; },
+    refreshAccount: async (row, opts) => {
+      assert.equal(opts.proxy, "http://127.0.0.1:7890");
+      if (row.email === "alice@example.com") return { ok: true, status: "valid", renewed: false, tokenState: "unexpired_unverified" };
+      return { ok: true, status: "renewed", renewed: true, tokenState: "unexpired_unverified" };
+    },
+  });
+  try {
+    const listed = await h.api("accounts");
+    assert.equal(listed.status, 200);
+    assert.equal(listed.json.total, 2);
+    assert.deepEqual(listed.json.summary, { total: 2, valid: 1, needsRenew: 1 });
+    assert.equal(listed.json.accounts[0].email, "al***@example.com");
+    assert.equal(listed.json.accounts[0].slotLabel, formatAccountSlotLabel("alice@example.com"));
+    assert.equal(listed.json.accounts[0].slotTag, accountSlotTag("alice@example.com"));
+    assert.equal(listed.json.accounts[0].tokenState, "unexpired_unverified");
+    assert.equal(listed.json.accounts[1].tokenState, "expired");
+    const opaque = listed.json.accounts[0].id;
+    assert.match(opaque, /^[a-f0-9]{32}$/);
+    assert(!JSON.stringify(listed.json).includes("alice@example.com"));
+    assert(!JSON.stringify(listed.json).includes(records[0].accessToken));
+
+    const refreshed = await h.api("accounts/refresh", { all: true, proxy: "http://127.0.0.1:7890" });
+    assert.equal(refreshed.status, 200);
+    assert.equal(refreshed.json.valid, 1);
+    assert.equal(refreshed.json.renewed, 1);
+    assert.equal(refreshed.json.failed, 0);
+    assert.equal(syncCalls, 1);
+    assert(!JSON.stringify(refreshed.json).includes("alice@example.com"));
+    assert(!JSON.stringify(refreshed.json).includes("bob@example.com"));
+
+    assert.equal((await h.api("accounts/refresh", { id: opaque, proxy: "socks5://bad" })).status, 400);
+    assert.equal((await h.api("remove", { id: opaque })).status, 200);
+    assert.equal(removed, "alice@example.com");
+    assert.equal((await h.api("remove", { id: opaque })).status, 404);
+  } finally { await h.close(); }
+});
+
+test("GUI is restricted to loopback, never LAN-exposed", async () => {
+  const bad = createGuiService({ port: 0, bind: "0.0.0.0" });
+  await assert.rejects(bad.listen(), /127.0.0.1/);
+});
+
+test("GUI auto-connects Magpie after successful pool import, no separate login", async () => {
+  let linked = 0;
+  const h = await harness({
+    onPoolChange: async () => { linked++; return { connected: true }; },
+    batch: async () => ({ total: 1, added: 1, reused: 0, failed: [] }),
+  });
+  try {
+    await h.api("preview", { text: `owner@example.com----pass----${seed}` });
+    assert.equal((await h.api("start", { mode: "pool", consent: true })).status, 202);
+    let state;
+    for (let i = 0; i < 40; i++) {
+      state = (await h.api("status")).json;
+      if (state.state === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+    assert.equal(state.result.added, 1);
+    assert.equal(state.providerConnected, true);
+    assert.equal(linked, 1);
+  } finally { await h.close(); }
+});
+
+test("only DSH HTTP pool import is exposed by GUI and failed batch cannot connect", async () => {
+  const h = await harness({
+    onPoolChange: async () => { throw Error("should not connect"); },
+    batch: async () => ({ total: 1, added: 0, reused: 0, failed: [{}] }),
+  });
+  try {
+    await h.api("preview", { text: `owner@example.com----pass----${seed}` });
+    assert.equal((await h.api("start", { mode: "native", consent: true })).status, 400);
+    const started = await h.api("start", { mode: "pool", consent: true });
+    assert.equal(started.status, 202);
+    let state;
+    for (let i = 0; i < 40; i++) {
+      state = (await h.api("status")).json;
+      if (state.state === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+    assert.equal(state.providerConnected, null);
+    assert.equal(state.result.added, 0);
+  } finally { await h.close(); }
+});
+
+test("GUI GET /api/draft enforces auth/origin, omits secrets from /ui HTML, and consumes one-shot", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "magpie-gui-draft-"));
+  const file = join(dir, "accounts.txt");
+  const secretTxt = `bad-line\nowner@example.com----topsecretpass----${seed}`;
+  await writeFile(file, secretTxt, { mode: 0o600 });
+  const h = await harness();
+  try {
+    const info = await h.service.stageDraft(file);
+    assert.equal(info.filename, "accounts.txt");
+    assert.equal(info.count, 1);
+    assert.equal(info.errors, 1);
+
+    // /ui HTML must not embed draft text or secrets
+    const pageHtml = await (await fetch(h.base + "ui")).text();
+    assert(!pageHtml.includes("topsecretpass"));
+    assert(!pageHtml.includes("owner@example.com"));
+    assert(!pageHtml.includes(seed));
+
+    // Security checks on /api/draft
+    assert.equal((await h.api("draft", undefined, { bearer: "0".repeat(64) })).status, 403);
+    assert.equal((await h.api("draft", undefined, { origin: "https://attacker.test" })).status, 403);
+
+    // First valid GET consumes draft; second returns hasDraft: false
+    const first = await h.api("draft");
+    assert.equal(first.status, 200);
+    assert.equal(first.json.hasDraft, true);
+    assert.equal(first.json.filename, "accounts.txt");
+    assert.equal(first.json.text, secretTxt);
+    assert.equal(first.json.validCount, 1);
+    assert.equal(first.json.errorCount, 1);
+
+    const second = await h.api("draft");
+    assert.equal(second.status, 200);
+    assert.equal(second.json.hasDraft, false);
+  } finally {
+    await h.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("GUI POST /api/sync and multi-account start progressively synchronize Providers", async () => {
+  let syncCalls = 0;
+  const h = await harness({
+    onPoolChange: async () => {
+      syncCalls++;
+      return { connected: true, count: 2 };
+    },
+    batch: async (args) => {
+      args.onProgress({ state: "added", line: 1, email: "a1***@example.com" });
+      args.onProgress({ state: "added", line: 2, email: "a2***@example.com" });
+      return { total: 2, added: 2, reused: 0, failed: [] };
+    },
+  });
+  try {
+    assert.equal((await h.api("sync", {}, { origin: "https://attacker.test" })).status, 403);
+    const manualSync = await h.api("sync", {});
+    assert.equal(manualSync.status, 200);
+    assert.deepEqual(manualSync.json, { synced: true, connected: true, count: 2 });
+    assert.equal(syncCalls, 1);
+
+    syncCalls = 0;
+    const twoAccounts = `a1@example.com----pw1----${seed}\na2@example.com----pw2----${seed}`;
+    await h.api("preview", { text: twoAccounts });
+    assert.equal((await h.api("start", { mode: "pool", consent: true })).status, 202);
+    let state;
+    for (let i = 0; i < 40; i++) {
+      state = (await h.api("status")).json;
+      if (state.state === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 15));
+    }
+    assert.equal(state.state, "completed");
+    assert.equal(state.providerConnected, true);
+    assert.equal(state.providerCount, 2);
+    assert.equal(syncCalls >= 2, true);
+  } finally { await h.close(); }
+});
+
+test("GUI exposes 额度统计 tab, per-account image quota pills, GET /api/stats, quotaOnly refresh, and stats cleanup on remove", async () => {
+  const alice = "alice@example.com";
+  const bob = "bob@example.com";
+  const records = [
+    { email: alice, accessToken: future(), totp: seed, password: "p1" },
+    { email: bob, accessToken: future(), totp: seed, password: "p2" },
+  ];
+  const store = createInMemoryStatsStore();
+  await recordQuotaCheck({ email: alice, quota: 7, hasImageLimit: true, planType: "free" }, { statsStore: store });
+  await recordImageCall({ email: alice, success: true, count: 1 }, { statsStore: store });
+  await recordQuotaCheck({ email: bob, quota: 0, hasImageLimit: true, planType: "free", restoreAt: new Date(Date.now() + 600_000).toISOString() }, { statsStore: store });
+  await recordImageCall({ email: bob, success: false, rateLimited: true, retryAfter: 600 }, { statsStore: store });
+
+  let refreshCount = 0;
+  const h = await harness({
+    poolRead: async () => records,
+    poolRemove: async (email) => {
+      const idx = records.findIndex((r) => r.email === email);
+      if (idx >= 0) records.splice(idx, 1);
+    },
+    statsStore: store,
+    runWorker: async (payload) => {
+      assert.equal(payload.action, "check_image_quota");
+      refreshCount++;
+      return {
+        ok: true,
+        quota: refreshCount === 1 ? 12 : 4,
+        restore_at: null,
+        has_image_limit: true,
+        plan_type: refreshCount === 1 ? "plus" : "free",
+      };
+    },
+  });
+  try {
+    // 1. The accounts workspace keeps independent text/image quotas, with old actions intact.
+    for (const label of ['data-tab="stats"', "账号管理", "文本额度", "生图额度", "调用统计与失效分类", "refreshTextQuota", "refreshStatsQuota", "statsRows", "policyPreset"]) {
+      assert(h.html.includes(label), "missing HTML element: " + label);
+    }
+    assert.match(h.html, /accept="\.rt,\.json,\.jsonl,\.txt,/);
+    assert.doesNotMatch(h.html, /batch-tier|policyTierAuto|policySweepEnabled|policyTextFeatures/);
+    const styleCss = await (await fetch(h.base + "assets/style.css")).text();
+    assert(styleCss.includes(".quota-overview"));
+    assert.match(h.html, /class="text-quota-card quota-summary-item"/);
+    assert.match(h.html, /class="image-quota-card quota-summary-item"/);
+    assert(styleCss.includes(".text-window-fill"));
+    assert(h.html.includes("重置时间"));
+    const appJs = await (await fetch(h.base + "assets/app.js")).text();
+    assert(appJs.includes('api("stats")'));
+    assert(appJs.includes('api("text-quota", id ? { id } : {})'));
+    assert(appJs.includes('api("policy", { preset })'));
+    assert(appJs.includes('api("accounts/refresh", { ids: chunk, quotaOnly, proxy })'));
+    assert(appJs.includes("生图额度："));
+    assert(!appJs.includes("innerHTML"));
+    assert(!appJs.includes("localStorage"));
+
+    // 2. Auth enforcement on /api/stats
+    assert.equal((await h.api("stats", undefined, { bearer: "0".repeat(64) })).status, 403);
+    assert.equal((await h.api("stats", undefined, { origin: "https://attacker.test" })).status, 403);
+
+    // 3. Initial /api/stats & /api/accounts payload
+    const st1 = await h.api("stats");
+    assert.equal(st1.status, 200);
+    assert.equal(st1.json.summary.total, 2);
+    assert.equal(st1.json.summary.active, 1);
+    assert.equal(st1.json.summary.limited, 1);
+    assert.equal(st1.json.summary.totalQuota, 6);
+    assert.equal(st1.json.summary.totalSuccess, 1);
+    assert.equal(st1.json.summary.totalFail, 1);
+    assert.equal(st1.json.accounts[0].imageQuota, 6);
+    assert.equal(st1.json.accounts[0].quotaStatus, "available");
+    assert.equal(st1.json.accounts[1].imageQuota, 0);
+    assert.equal(st1.json.accounts[1].quotaStatus, "limited");
+    assert(!JSON.stringify(st1.json).includes(alice));
+    assert(!JSON.stringify(st1.json).includes(records[0].accessToken));
+
+    // 4. quotaOnly refresh updates both accounts via default refreshPoolAccount + injected runWorker
+    const refreshed = await h.api("accounts/refresh", { all: true, quotaOnly: true });
+    assert.equal(refreshed.status, 200);
+    assert.equal(refreshed.json.quotaChecked, 2);
+    assert.equal(refreshed.json.quotaStats.active, 2);
+    assert.equal(refreshed.json.quotaStats.limited, 0);
+    assert.equal(refreshed.json.quotaStats.totalQuota, 16);
+    assert.equal(refreshed.json.accounts[0].planType, "plus");
+
+    // 5. Removing alice cleans up per-account quota while preserving bob & totals
+    const aliceId = st1.json.accounts[0].id;
+    assert.equal((await h.api("remove", { id: aliceId })).status, 200);
+    const st2 = await h.api("stats");
+    assert.equal(st2.json.summary.total, 1);
+    assert.equal(st2.json.summary.active, 1);
+    assert.equal(st2.json.summary.totalQuota, 4);
+    assert.equal(st2.json.summary.totalSuccess, 1);
+    assert.equal(st2.json.summary.totalFail, 1);
+  } finally {
+    await h.close();
+  }
+});
+
+test("GUI 账号池有搜索 / 分组 / 排序 / 常驻批量栏，Token 徽章区分已确认与未确认", async () => {  const h = await harness({ poolRead: async () => [] });
+  try {
+    for (const id of [
+      "poolSearch", "poolGroupSelect", "poolSortSelect", "poolFilterInfo",
+      "poolBatchBar", "poolBatchCheck", "poolBatchRemove", "poolBatchClear", "poolPickAll",
+    ]) {
+      assert(h.html.includes(`id="${id}"`), "missing pool control: " + id);
+    }
+    // 批量栏不再靠勾选才出现，否则用户找不到批量删除。
+    assert(!/id="poolBatchBar"[^>]*class="batch-bar hidden"/.test(h.html));
+    assert(h.html.includes('class="sort-th"'));
+    assert(h.html.includes('data-sort="quota"'));
+    const app = await (await fetch(h.base + "assets/app.js")).text();
+    assert(app.includes("function tokenBadge"));
+    assert(app.includes("Token 已确认"));
+    assert(app.includes("Token 未确认"));
+    assert(!app.includes("待请求确认"), "含糊的旧文案应删除");
+    assert(app.includes("function poolGroupKey"));
+    assert(app.includes("function visibleAccounts"));
+    assert(app.includes("function sortedForStats"));
+    // 趋势图能在按日/周/月/年之间切换
+    assert(h.html.includes('id="historyPeriod"'));
+    assert(h.html.includes('value="week"'));
+    assert(h.html.includes('value="month"'));
+    assert(h.html.includes('value="year"'));
+    assert(app.includes("HISTORY_VIEWS"));
+    assert(app.includes("function historyBuckets"));
+    // 页面跑在 Magpie 的沙箱 iframe 里，原生 confirm() 会被浏览器静默丢弃
+    // （返回 false），点了批量删除就像没反应。确认框必须自己画。
+    assert(!/window\.confirm\s*\(/.test(app), "沙箱 iframe 里 window.confirm 不生效");
+    assert(!/\balert\s*\(/.test(app), "沙箱 iframe 里 alert 不生效");
+    assert(app.includes("function confirmAction"));
+    assert(app.includes("confirm-layer"));
+    // 批量操作要有进度反馈：按钮变文案 + 转圈 + 已处理/总数
+    assert(h.html.includes('id="poolBatchStatus"'));
+    assert(h.html.includes('id="batchStatus"'));
+    assert(app.includes("function setPoolTask"));
+    assert(app.includes("function renderBatchStatus"));
+    assert(app.includes("function chunksOf"));
+    assert(app.includes("正在删除账号…"));
+    assert(app.includes("BATCH_CHUNK"));
+    // 每个按钮都要有 loading：统一走 withOp，且短请求也要亮够时间，
+    // 否则几十毫秒就回来的操作看起来还是「点了没反应」。
+    assert(app.includes("async function withOp"));
+    assert(app.includes("OP_MIN_MS"));
+    // 检测/刷新是逐个号打上游，慢得多：必须前端分批驱动才能报 12 / 100，
+    // 一个请求等到底的话中途一个字都不会返回。
+    assert(app.includes("REFRESH_CHUNK"));
+    assert(app.includes("function mergeRefreshTotals"));
+    assert(app.includes("chunksOf(ids, REFRESH_CHUNK)"));
+    assert(app.includes("function applyRefreshRows"));
+    // 禁用要能还原，不然「刷新列表」点一次就永久变灰
+    assert(app.includes("wasDisabled"));
+    // 行内按钮跟着 poolBusy 走：列表是在 poolBusy=true 时渲染的
+    assert(app.includes(".row-act"));
+    // 服务重启时端口不监听，fetch 直接 reject，等它起来而不是让用户重开页面
+    assert(app.includes("function wakeService"));
+    assert(app.includes("WAKE_DELAYS"));
+    assert(!app.includes("无法连接本地导入服务"), "重启窗口不该让用户重开页面");
+    // 写请求不自动重试：失败原因拿不到，重发有重复提交风险
+    assert(app.includes("data === undefined && mayWake && await wakeService()"));
+    // 失败原因不能只显示 worker_timeout 这种代号，要有中文名 + 悬停解释。
+    assert(app.includes("生图超时（本地掐断）"));
+    assert(app.includes("function errorHint"));
+    assert(app.includes("ERROR_HINTS"));
+    const css = await (await fetch(h.base + "assets/style.css")).text();
+    assert(css.includes(".confirm-layer"));
+    assert(css.includes(".batch-status"));
+    assert(css.includes("@keyframes batch-spin"));
+    assert(css.includes(".confirm-box"));
+    assert(!app.includes("innerHTML"));
+    assert(!app.includes("localStorage"));
+  } finally { await h.close(); }
+});
+
+test("pool events surface through /api/logs and policy writes are logged", async () => {
+  const home = await mkdtemp(join(tmpdir(), "gptfree-events-"));
+  const prevHome = process.env.MAGPIE_GPTFREE_HOME;
+  // 策略写的是 settings.json，必须指到临时目录，别动真实号池的配置。
+  process.env.MAGPIE_GPTFREE_HOME = home;
+  const h = await harness({
+    poolRead: async () => [],
+    statsStore: createInMemoryStatsStore(),
+  });
+  try {
+    clearPoolEvents();
+    const saved = await h.api("policy", { preset: "roundRobin" });
+    assert.equal(saved.status, 200);
+    assert.equal(saved.json.preset, "roundRobin");
+    const policy = await h.api("policy");
+    assert.deepEqual(policy.json.presets.map(({ id }) => id), ["quotaFirst", "roundRobin", "preferred", "segmented"]);
+    assert.equal(policy.json.preset, "roundRobin");
+    assert.equal((await h.api("policy", { preset: "roundRobin", sweep: {} })).status, 400);
+
+    const logs = await h.api("logs");
+    assert.equal(logs.status, 200);
+    const change = logs.json.events.find((e) => e.kind === "policy.change");
+    assert(change, "the policy write is in the event log");
+    assert.equal(change.strategy, "roundRobin");
+    assert(change.keys.includes("preset"));
+    assert.equal(logs.json.pid, process.pid);
+  } finally {
+    await h.close();
+    if (prevHome === undefined) delete process.env.MAGPIE_GPTFREE_HOME;
+    else process.env.MAGPIE_GPTFREE_HOME = prevHome;
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("a failed image quota account does not stop the rest of a refresh batch", async () => {
+  const rows = ["before@example.test", "broken@example.test", "after@example.test"]
+    .map((email) => ({ email, accessToken: future() }));
+  const calls = [];
+  const h = await harness({
+    poolRead: async () => rows,
+    refreshAccount: async (row) => {
+      calls.push(row.email);
+      if (row === rows[1]) throw new Error("Worker could not start");
+      return { ok: true, status: "valid", quotaOk: true, imageQuota: 12 };
+    },
+  });
+  try {
+    const list = await h.api("accounts");
+    const ids = list.json.accounts.map((row) => row.id);
+    const response = await h.api("accounts/refresh", { ids: [ids[0], ids[0], ...ids.slice(1)], quotaOnly: true });
+    assert.equal(response.status, 200);
+    assert.deepEqual(calls, rows.map((row) => row.email));
+    assert.equal(response.json.total, 3);
+    assert.equal(response.json.quotaChecked, 2);
+    assert.equal(response.json.quotaFailed, 1);
+    assert.equal(response.json.results[1].id, ids[1]);
+    assert.equal(response.json.results[2].imageQuota, 12);
+  } finally { await h.close(); }
+});
+
+test("text quota uses opaque account IDs and an explicit refresh", async () => {
+  const email = "text-quota-demo@example.com";
+  const accessToken = future();
+  let calls = 0;
+  const h = await harness({
+    poolRead: async () => [{ email, accessToken }],
+    sessionFile: false,
+    textQuotaFetcher: async (url, init) => {
+      calls++;
+      assert.equal(new URL(url).pathname, "/backend-api/wham/usage");
+      assert.equal(init.method, "GET");
+      return Response.json({ rate_limit: { allowed: true, primary_window: {
+        used_percent: 25, limit_window_seconds: 18_000, reset_after_seconds: 120,
+      } } });
+    },
+  });
+  try {
+    const quota = await h.api("text-quota");
+    const id = (await h.api("accounts")).json.accounts[0].id;
+    assert.equal(quota.json.accounts[0].id, id);
+    assert.equal(quota.json.accounts[0].status, "unknown");
+    assert.equal(calls, 0);
+    assert.equal((await h.api("text-quota", { id }, { bearer: "invalid" })).status, 403);
+    assert.equal((await h.api("text-quota", { email })).status, 400);
+    const result = await h.api("text-quota", { id });
+    assert.equal(result.status, 200);
+    assert.equal(result.json.accounts[0].shortWindow.usedPercent, 25);
+    assert.equal(result.json.accounts[0].longWindow, null);
+    assert.equal(result.json.accounts[0].status, "available");
+    assert.equal(calls, 1);
+    assert(!JSON.stringify(result.json).includes(email));
+    assert(!JSON.stringify(result.json).includes(accessToken));
+  } finally { await h.close(); }
+});
+
+test("text quota batch returns immediately and a reloaded page sees progress", async () => {
+  let start, release;
+  const started = new Promise((resolve) => { start = resolve; });
+  const upstream = new Promise((resolve) => { release = resolve; });
+  const account = { email: "batch-quota@example.test", accessToken: future() };
+  let calls = 0;
+  const h = await harness({
+    poolRead: () => [account],
+    sessionFile: false,
+    textQuotaFetcher: async () => {
+      calls++;
+      start();
+      await upstream;
+      return Response.json({ rate_limit: { allowed: true } });
+    },
+  });
+  try {
+    assert.equal((await h.api("text-quota")).json.job, null);
+    assert.equal((await h.api("text-quota", {}, { bearer: "invalid" })).status, 403);
+    assert.equal((await h.api("text-quota", {}, { origin: "https://untrusted.example" })).status, 403);
+    assert.equal((await h.api("text-quota", {}, { contentType: false })).status, 403);
+    assert.equal((await h.api("text-quota", { id: "x".repeat(5000) })).status, 413);
+    assert.equal((await h.api("text-quota", { id: "0".repeat(32) })).status, 404);
+    assert.equal(calls, 0);
+    const result = await h.api("text-quota", {});
+    assert.equal(result.status, 202);
+    assert.equal(result.json.job.attempted, 0);
+    assert.equal(result.json.accounts[0].reason, "not_checked");
+    await started;
+    const reload = await (await fetch(h.base + "ui")).text();
+    const bearer = reload.match(/meta name="gptfree-session" content="([0-9a-f]{64})"/)?.[1];
+    assert.ok(bearer && bearer !== h.token);
+    const progress = await h.api("text-quota", undefined, { bearer });
+    assert.equal(progress.json.job.id, result.json.job.id);
+    assert.equal(progress.json.job.inFlight, 1);
+    const duplicate = await h.api("text-quota", {}, { bearer });
+    assert.equal(duplicate.status, 202);
+    assert.equal(duplicate.json.job.id, result.json.job.id);
+    assert.equal(calls, 1);
+    release();
+    const done = await h.api("text-quota", undefined, { bearer });
+    assert.equal(done.json.job.state, "completed");
+    assert.equal(done.json.job.succeeded, 1);
+    assert.equal(done.json.accounts[0].status, "available");
+  } finally {
+    release();
+    await h.close();
+  }
+});
+
+test("GUI keeps a page usable across a plugin-host restart (persisted capability)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "gptfree-session-"));
+  const sessionFile = join(dir, "gui-sessions.json");
+  const first = createGuiService({ port: 0, sessionFile, poolRead: async () => [] });
+  const addr = await first.listen();
+  const base = "http://127.0.0.1:" + addr.port + "/";
+  let token;
+  try {
+    const html = await (await fetch(base + "ui")).text();
+    token = html.match(/meta name="gptfree-session" content="([0-9a-f]{64})"/)?.[1];
+    assert(token, "the page gets its capability");
+    // close() 现在会等待会话文件落盘（见 close 的实现），所以这里**不轮询、不 sleep**：
+    // 关闭返回后文件必须已经就位。以前是 fire-and-forget，只能靠 sleep 等 rename。
+    await first.close();
+    const stored = JSON.parse(await readFile(sessionFile, "utf8"));
+    assert.equal(stored.sessions.length, 1);
+    assert.equal(stored.sessions[0].id, token);
+    assert(!JSON.stringify(stored).includes("@"), "no account data in the session file");
+  } finally {
+    await first.close();
+  }
+
+  // A restarted host (new process, new service) still accepts the open page.
+  const second = createGuiService({ port: 0, sessionFile, poolRead: async () => [] });
+  const addr2 = await second.listen();
+  const base2 = "http://127.0.0.1:" + addr2.port + "/";
+  try {
+    const resumed = await fetch(base2 + "api/accounts", {
+      headers: { Origin: "null", "X-GPTFree-Session": token },
+    });
+    assert.equal(resumed.status, 200, "an open page survives a host restart");
+    // A capability never issued by this plugin is still refused.
+    const forged = await fetch(base2 + "api/accounts", {
+      headers: { Origin: "null", "X-GPTFree-Session": "0".repeat(64) },
+    });
+    assert.equal(forged.status, 403);
+  } finally {
+    await second.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+
+// 健康检查是给 cron / 面板用的：不能要求 GUI 会话，否则监控脚本没法调。
+test("GET /api/health reports pool capacity without a GUI session", async () => {
+  const store = createInMemoryStatsStore();
+  const rows = ["a@example.com", "b@example.com", "c@example.com"].map((email) => ({
+    email, password: "p", totp: seed, accessToken: future(),
+  }));
+  for (const row of rows) {
+    await recordQuotaCheck({ email: row.email, quota: 20 }, { statsStore: store });
+  }
+
+  const h = await harness({ poolRead: async () => rows, statsStore: store });
+  try {
+    const res = await fetch(h.base + "api/health");
+    const body = await res.json();
+    assert.equal(res.status, 200, "a pool above the thresholds is healthy");
+    assert.equal(body.ok, true);
+    assert.equal(body.usable, 3);
+    assert.equal(body.totalQuota, 60);
+    assert.equal(body.dead, 0);
+    assert.equal(body.total, 3);
+    assert.equal(body.thresholds.minUsable, 3);
+    assert.ok(!JSON.stringify(body).includes("@"), "health output carries no emails");
+  } finally {
+    await h.close();
+  }
+});
+
+test("GET /api/health answers 503 when the pool drops below the usable threshold", async () => {
+  const store = createInMemoryStatsStore();
+  const rows = [{ email: "only@example.com", password: "p", totp: seed, accessToken: future() }];
+  await recordQuotaCheck({ email: "only@example.com", quota: 20 }, { statsStore: store });
+
+  const h = await harness({ poolRead: async () => rows, statsStore: store });
+  try {
+    const res = await fetch(h.base + "api/health");
+    const body = await res.json();
+    assert.equal(res.status, 503, "a single usable account is not enough");
+    assert.equal(body.ok, false);
+    assert.equal(body.usable, 1);
+  } finally {
+    await h.close();
+  }
+});
+
+test("GUI removes and re-checks a whole selection in one request", async () => {
+  const store = createInMemoryStatsStore();
+  const records = [
+    { email: "a@example.com", accessToken: future(), totp: seed, password: "s" },
+    { email: "b@example.com", accessToken: future(), totp: seed, password: "s" },
+    { email: "c@example.com", accessToken: future(), totp: seed, password: "s" },
+  ];
+  const removed = [];
+  const refreshed = [];
+  const h = await harness({
+    poolRead: async () => records.filter((r) => !removed.includes(r.email)),
+    poolRemove: async (email) => { removed.push(email); },
+    statsStore: store,
+    onPoolChange: async () => ({ connected: true }),
+    refreshAccount: async (row) => {
+      refreshed.push(row.email);
+      return { ok: true, status: "valid", renewed: false, tokenState: "unexpired_unverified" };
+    },
+  });
+  try {
+    const listed = await h.api("accounts");
+    const ids = listed.json.accounts.map((a) => a.id);
+    assert.equal(ids.length, 3);
+
+    // 勾两个复检：一次请求，不是两次。
+    const check = await h.api("accounts/refresh", { ids: ids.slice(0, 2), quotaOnly: true });
+    assert.equal(check.status, 200);
+    assert.deepEqual(refreshed.sort(), ["a@example.com", "b@example.com"]);
+
+    // 勾两个删除：返回删掉的条数，第三个还在。
+    const gone = await h.api("remove", { ids: ids.slice(0, 2) });
+    assert.equal(gone.status, 200);
+    assert.equal(gone.json.count, 2);
+    assert.deepEqual(removed.sort(), ["a@example.com", "b@example.com"]);
+    assert.equal((await h.api("accounts")).json.total, 1);
+
+    // 空的 ids 不能被当成「全删」。
+    assert.equal((await h.api("remove", { ids: [] })).status, 400);
+    assert.equal(removed.length, 2);
+  } finally { await h.close(); }
+});
+
+test("reply mode is editable from the panel and says so when an env var overrides it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "gptfree-gui-settings-"));
+  const previousHome = process.env.MAGPIE_GPTFREE_HOME;
+  process.env.MAGPIE_GPTFREE_HOME = dir;
+  let h = null;
+  try {
+    h = await harness({
+      poolRead: async () => [],
+      statsStore: createInMemoryStatsStore(),
+    });
+
+    // 没设置过：默认 both，没人压着。
+    const initial = await h.api("stats");
+    assert.equal(initial.status, 200);
+    assert.deepEqual(initial.json.imageReply, {
+      mode: "both", source: "default", modes: ["both", "url", "markdown"], locked: false,
+    });
+
+    // 面板改一次：写文件、立即生效。
+    const saved = await h.api("settings", { imageReply: "url" });
+    assert.equal(saved.status, 200);
+    assert.equal(saved.json.imageReply.mode, "url");
+    assert.equal(saved.json.imageReply.source, "settings");
+    assert.equal(JSON.parse(await readFile(join(dir, "settings.json"), "utf8")).imageReply, "url");
+    assert.equal((await h.api("stats")).json.imageReply.mode, "url");
+
+    // 不认识的值 400，而且不能把已有设置写坏。
+    const bad = await h.api("settings", { imageReply: "gif" });
+    assert.equal(bad.status, 400);
+    assert.equal((await h.api("stats")).json.imageReply.mode, "url");
+
+    // 环境变量压着：写入照样落盘，但必须如实说「不生效」，并标记 locked。
+    process.env.MAGPIE_GPTFREE_IMAGE_REPLY = "markdown";
+    const locked = await h.api("stats");
+    assert.equal(locked.json.imageReply.locked, true);
+    assert.equal(locked.json.imageReply.mode, "markdown");
+    const attempt = await h.api("settings", { imageReply: "both" });
+    assert.equal(attempt.status, 200);
+    assert.equal(attempt.json.imageReply.mode, "markdown");
+    assert.equal(attempt.json.imageReply.locked, true);
+    assert.match(attempt.json.message, /环境变量/);
+  } finally {
+    if (h) await h.close();
+    if (previousHome === undefined) delete process.env.MAGPIE_GPTFREE_HOME;
+    else process.env.MAGPIE_GPTFREE_HOME = previousHome;
+    delete process.env.MAGPIE_GPTFREE_IMAGE_REPLY;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("startGuiServer retries a busy port, and recovers once the old host releases it", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "gptfree-gui-port-"));
+  const previousHome = process.env.MAGPIE_GPTFREE_HOME;
+  process.env.MAGPIE_GPTFREE_HOME = dir;
+
+  // 占住一个端口，模拟「热更新时旧 host 还没释放端口」。
+  const blocker = createServer();
+  await new Promise((resolve) => blocker.listen(0, "127.0.0.1", resolve));
+  const port = blocker.address().port;
+  let service = null;
+  try {
+    // 端口一直被占：退避重试完仍然失败，错误文案里要写清试了几次（warn 会带出去）。
+    // guardIntervalMs:0 关掉后台守护，这里只验证纯前台失败的行为。
+    await assert.rejects(
+      () => startGuiServer({ port, retryDelays: [10, 10, 10], guardIntervalMs: 0 }),
+      (err) => /port already in use/.test(err.message) && /tried 4 time/.test(err.message),
+    );
+
+    // 旧 host 让出端口后再调一次就能起来 —— 这就是热更新后页面能自己恢复的原因，
+    // 不用再 docker restart。
+    await new Promise((resolve) => blocker.close(resolve));
+    service = await startGuiServer({ port, retryDelays: [10] });
+    const html = await (await fetch(`http://127.0.0.1:${port}/ui`)).text();
+    assert.match(html, /GPT 号池/);
+  } finally {
+    if (service) await service.close();
+    await stopGuiServer();
+    if (blocker.listening) await new Promise((resolve) => blocker.close(resolve));
+    if (previousHome === undefined) delete process.env.MAGPIE_GPTFREE_HOME;
+    else process.env.MAGPIE_GPTFREE_HOME = previousHome;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("startGuiServer 前台重试失败后，后台守护在端口释放后自动恢复", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "gptfree-gui-guard-"));
+  const previousHome = process.env.MAGPIE_GPTFREE_HOME;
+  process.env.MAGPIE_GPTFREE_HOME = dir;
+
+  // 占住端口，模拟「宿主热更新时旧 host 还攥着 37990」。
+  const blocker = createServer();
+  await new Promise((resolve) => blocker.listen(0, "127.0.0.1", resolve));
+  const port = blocker.address().port;
+  try {
+    // 前台只给 1 次重试：端口仍被占，必定 reject，但错误文案要标明已挂后台守护。
+    await assert.rejects(
+      () => startGuiServer({ port, retryDelays: [10], guardIntervalMs: 20, guardWindowMs: 5000 }),
+      (err) => /port already in use/.test(err.message) && /background retry scheduled/.test(err.message),
+    );
+
+    // 旧 host 让出端口 —— 后台守护应当自己把服务捞起来，无需再手动调 startGuiServer。
+    await new Promise((resolve) => blocker.close(resolve));
+
+    // 轮询预算要留够：全量跑时这个文件和其他测试文件并行，事件循环会被挤占，
+    // 2.4 秒（120×20ms）偶尔不够，表现为「只有全量跑才偶发失败」。
+    // 守护窗口本身是 5 秒，这里给 6 秒，断言强度不变。
+    let recovered = false;
+    for (let i = 0; i < 300; i++) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/ui`);
+        if (res.status === 200) { recovered = true; break; }
+      } catch {}
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.ok(recovered, "background guard should recover the GUI service once the port is free");
+  } finally {
+    await stopGuiServer();
+    if (blocker.listening) await new Promise((resolve) => blocker.close(resolve));
+    if (previousHome === undefined) delete process.env.MAGPIE_GPTFREE_HOME;
+    else process.env.MAGPIE_GPTFREE_HOME = previousHome;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("GUI 生图错误日志：GET /api/image-errors 读最近记录，POST clear 清空", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "gptfree-gui-errlog-"));
+  const previousHome = process.env.MAGPIE_GPTFREE_HOME;
+  process.env.MAGPIE_GPTFREE_HOME = join(dir, "home");
+  const h = await harness({ poolRead: async () => [] });
+  try {
+    // 设置页真的有这块表，不然接口通了也没地方看。
+    assert.match(h.html, /id="imageErrorLogRows"/);
+    assert.match(h.html, /id="imageErrorLogClear"/);
+    // 一条都没有时也要能读（返回空数组，不是 404 —— 面板一进设置页就会拉）。
+    let res = await h.api("image-errors");
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.json.items, []);
+    assert.equal(res.json.total, 0);
+    assert.equal(res.json.limit, IMAGE_ERROR_LOG_MAX_LIMIT);
+
+    const at = Date.parse("2026-11-16T02:00:00");
+    await appendImageErrorLog({
+      email: "someone@example.com",
+      code: "upstream_text_reply",
+      status: 502,
+      message: "图片生成功能暂时不可用。输出尺寸要求：1024 × 1024。",
+    }, { nowMs: at });
+    await appendImageErrorLog({
+      email: "someone@example.com",
+      code: "upstream_rate_limited",
+      status: 429,
+      message: "Image generation is temporarily unavailable.",
+    }, { nowMs: at + 1000 });
+
+    res = await h.api("image-errors?limit=10");
+    assert.equal(res.status, 200);
+    assert.equal(res.json.total, 2);
+    assert.equal(res.json.items[0].code, "upstream_rate_limited", "新的在前");
+    assert.equal(res.json.items[1].code, "upstream_text_reply");
+    assert.equal(res.json.items[1].status, 502);
+    // 邮箱不能出现在接口返回里，只能是槽位号。
+    const raw = JSON.stringify(res.json);
+    assert.doesNotMatch(raw, /someone@example\.com/);
+    assert.match(res.json.items[0].tag, /^s[0-9a-f]{10}$/);
+
+    // limit 只影响条数，不影响 total。
+    res = await h.api("image-errors?limit=1");
+    assert.equal(res.json.items.length, 1);
+    assert.equal(res.json.total, 2);
+
+    res = await h.api("image-errors/clear", {});
+    assert.equal(res.status, 200);
+    assert.equal(res.json.removed, 2);
+    res = await h.api("image-errors");
+    assert.equal(res.json.total, 0);
+  } finally {
+    await h.close();
+    if (previousHome === undefined) delete process.env.MAGPIE_GPTFREE_HOME;
+    else process.env.MAGPIE_GPTFREE_HOME = previousHome;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------- 运行面板（0.10.0） ----------
+
+test("the live dashboard exposes capacity, forecast and the request ring without leaking emails", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "gptfree-gui-live-"));
+  const previousHome = process.env.MAGPIE_GPTFREE_HOME;
+  process.env.MAGPIE_GPTFREE_HOME = dir;
+
+  clearRequestLog();
+  const alice = "live-alice@example.com";
+  const bob = "live-bob@example.com";
+  const store = createInMemoryStatsStore();
+  // alice 检测时 40、现在 30：有消耗速率和耗尽预测；bob 额度已空。
+  await recordQuotaCheck({
+    email: alice,
+    quota: 40,
+    hasImageLimit: true,
+    planType: "plus",
+    limits: [{ feature: "image_gen", remaining: 40 }, { feature: "other_tool", remaining: 9 }],
+  }, { statsStore: store });
+  await recordQuotaCheck({ email: bob, quota: 0, hasImageLimit: true, planType: "free" }, { statsStore: store });
+
+  const h = await harness({
+    poolRead: async () => [
+      { email: alice, accessToken: future(), totp: seed, password: "p1" },
+      { email: bob, accessToken: future(), totp: seed, password: "p2" },
+    ],
+    statsStore: store,
+  });
+  try {
+    // 静态：tab 在页面里，且整页没有任何外链 / CDN（沙箱 iframe 里会被 CSP 拦）。
+    assert(h.html.includes('data-tab="live"'), "运行 tab 必须在导航里");
+    assert(h.html.includes('id="livePanel"'));
+    assert(h.html.includes('id="liveRows"'));
+    // placeholder 里出现 http:// 是示例文本，真正要防的是 src/href 指向外部资源。
+    assert.doesNotMatch(h.html, /(?:src|href)="https?:\/\//, "沙箱页不能引用任何外部资源");
+    assert.doesNotMatch(h.html, /(?:src|href)="\/\//, "不能用协议相对地址绕开检查");
+    const appJs = await (await fetch(h.base + "assets/app.js")).text();
+    assert(appJs.includes('api("dashboard")'));
+    assert(appJs.includes("requests?since="));
+    assert(appJs.includes("visibilitychange"));
+    assert(!appJs.includes("innerHTML"), "沿用 textContent 拼 DOM，不引 innerHTML");
+    assert(!appJs.includes("localStorage"));
+    const styleCss = await (await fetch(h.base + "assets/style.css")).text();
+    assert(styleCss.includes(".live-row"));
+    assert(styleCss.includes(".live-table"));
+
+    // 鉴权：和 /api/stats 一样，缺 session 或跨站 Origin 一律 403。
+    assert.equal((await h.api("dashboard", undefined, { bearer: "0".repeat(64) })).status, 403);
+    assert.equal((await h.api("dashboard", undefined, { origin: "https://attacker.test" })).status, 403);
+    assert.equal((await h.api("requests", undefined, { bearer: "0".repeat(64) })).status, 403);
+
+    // 空 ring：接口仍然 200，且明确告诉前端「没数据」而不是抛错。
+    let ring = await h.api("requests?limit=10");
+    assert.equal(ring.status, 200);
+    assert.equal(ring.json.items.length, 0);
+    assert.equal(ring.json.reset, false);
+
+    const dash = await h.api("dashboard");
+    assert.equal(dash.status, 200);
+    assert.equal(dash.json.capacity.total, 2);
+    assert.equal(dash.json.capacity.active, 1);
+    // ring 空的时候成功率是 null（不是 0%），前端据此显示「—」。
+    assert.equal(dash.json.metrics.count, 0);
+    assert.equal(dash.json.metrics.successRate, null);
+    assert.equal(dash.json.metrics.inflight, 0);
+    assert.ok(Array.isArray(dash.json.forecast.items));
+    assert.ok(Array.isArray(dash.json.activity));
+    assert.ok(Array.isArray(dash.json.recent.items));
+    // 预测里只有「有检测快照 + 还有额度」的号，且不能带邮箱。
+    const raw = JSON.stringify(dash.json);
+    assert.doesNotMatch(raw, /live-alice@example\.com/);
+    assert.doesNotMatch(raw, /live-bob@example\.com/);
+    for (const row of dash.json.forecast.items) {
+      assert.match(row.slotTag, /^s[0-9a-f]{10}$/);
+    }
+    // limits 全量落盘后要能在行数据里看到（0.10.0 只观测，不派生 textQuota）。
+    const stats = await h.api("stats");
+    const limitsRow = stats.json.accounts.find((row) => row.limits && row.limits.length);
+    assert.ok(limitsRow, "带 limits 的账号行要把它暴露出来");
+    assert.deepEqual(limitsRow.limits.map((item) => item.feature).sort(), ["image_gen", "other_tool"]);
+    // 0.11.0：生效权重由 gui-service 用 pool-weight 现算，必须是正数。
+    assert.ok(limitsRow.effectiveWeight > 0, "生效权重应该算出来了");
+    assert.equal(limitsRow.autoTier !== undefined, true, "自动分级也要给出来（哪怕只展示）");
+    assert.ok(stats.json.summary.utilization);
+
+    // 写一条请求进 ring，增量拉取应该只回这一条。
+    const first = recordRequest({ kind: "image", email: alice, ok: true, ms: 4200, ttfbMs: 900, n: 1 });
+    ring = await h.api("requests?since=0&limit=10");
+    assert.equal(ring.json.items.length, 1);
+    assert.equal(ring.json.items[0].seq, first.seq);
+    assert.equal(ring.json.items[0].tag, accountSlotTag(alice));
+    assert.equal(ring.json.items[0].ttfbMs, 900);
+    assert.doesNotMatch(JSON.stringify(ring.json), /live-alice@example\.com/);
+
+    // 游标前进后没有新记录 → 空数组，不是重复推一遍。
+    const idle = await h.api(`requests?since=${first.seq}&limit=10`);
+    assert.equal(idle.json.items.length, 0);
+    assert.equal(idle.json.reset, false);
+
+    // 游标比服务端还新（进程重启）→ reset，前端整段重画。
+    const stale = await h.api("requests?since=9999&limit=10");
+    assert.equal(stale.json.reset, true);
+    assert.equal(stale.json.items.length, 1);
+
+    // 清空：GET 不认，POST 才生效。
+    assert.equal((await h.api("requests/clear")).status, 404);
+    assert.equal((await h.api("requests/clear", {})).status, 200);
+    assert.equal((await h.api("requests?limit=10")).json.items.length, 0);
+  } finally {
+    clearRequestLog();
+    await h.close();
+    if (previousHome === undefined) delete process.env.MAGPIE_GPTFREE_HOME;
+    else process.env.MAGPIE_GPTFREE_HOME = previousHome;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------- 导入批次（0.10.1） ----------
+
+test("batch metadata reaches the panel, and rows carry the import date", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "gptfree-gui-batch-"));
+  const previousHome = process.env.MAGPIE_GPTFREE_HOME;
+  process.env.MAGPIE_GPTFREE_HOME = dir;
+
+  const email = "batch-gui@example.com";
+  const batchId = newBatchId(Date.UTC(2026, 10, 18, 2, 54, 0));
+  await recordBatch(
+    { id: batchId, label: "11月采购批", importedAt: "2026-11-18T02:54:00.000Z", count: 1, source: "gui" },
+    { file: join(dir, "batches.json") },
+  );
+
+  const h = await harness({
+    poolRead: async () => [{
+      email, accessToken: future(), totp: seed, password: "p",
+      batchId, addedAt: "2026-11-18T02:54:00.000Z",
+    }],
+    statsStore: createInMemoryStatsStore(),
+  });
+  try {
+    // 静态：批次区块在页面里，前端有对应的渲染入口。
+    assert(h.html.includes('id="liveBatches"'), "运行页要有导入批次区块");
+    assert(h.html.includes('id="liveBatchInfo"'));
+    const appJs = await (await fetch(h.base + "assets/app.js")).text();
+    assert(appJs.includes("renderLiveBatches"));
+    assert(appJs.includes("batchNoteText"));
+
+    const stats = await h.api("stats");
+    assert.equal(stats.status, 200);
+    assert.equal(stats.json.batches.length, 1);
+    assert.equal(stats.json.batches[0].id, batchId);
+    assert.equal(stats.json.batches[0].label, "11月采购批");
+
+    const row = stats.json.accounts[0];
+    assert.equal(row.batchId, batchId);
+    assert.equal(row.addedAt, "2026-11-18T02:54:00.000Z");
+
+    // 运行面板的批次聚合：一个号、成功率还没数据（null 而不是 0）。
+    const dash = await h.api("dashboard");
+    assert.equal(dash.json.batches.length, 1);
+    assert.equal(dash.json.batches[0].accounts, 1);
+    assert.equal(dash.json.batches[0].label, "11月采购批");
+    assert.equal(dash.json.batches[0].successRate, null);
+
+    // 批次元数据里不能夹带邮箱。
+    assert.doesNotMatch(JSON.stringify(stats.json), /batch-gui@example\.com/);
+    assert.doesNotMatch(JSON.stringify(dash.json), /batch-gui@example\.com/);
+  } finally {
+    await h.close();
+    if (previousHome === undefined) delete process.env.MAGPIE_GPTFREE_HOME;
+    else process.env.MAGPIE_GPTFREE_HOME = previousHome;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an account without batch info falls back to the legacy batch", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "gptfree-gui-legacy-"));
+  const previousHome = process.env.MAGPIE_GPTFREE_HOME;
+  process.env.MAGPIE_GPTFREE_HOME = dir;
+
+  const h = await harness({
+    // 老记录：账号库里没有 batchId / addedAt。
+    poolRead: async () => [
+      { email: "legacy-gui@example.com", accessToken: future(), totp: seed, password: "p" },
+    ],
+    statsStore: createInMemoryStatsStore(),
+  });
+  try {
+    const stats = await h.api("stats");
+    const row = stats.json.accounts[0];
+    assert.equal(row.batchId, "b00000000000000", "没有批次信息就归历史批次");
+    assert.equal(row.addedAt, null, "不能拿 updatedAt 冒充导入时间");
+    assert.equal(stats.json.batches[0].id, "b00000000000000");
+    assert.equal(stats.json.batches[0].importedAt, null);
+  } finally {
+    await h.close();
+    if (previousHome === undefined) delete process.env.MAGPIE_GPTFREE_HOME;
+    else process.env.MAGPIE_GPTFREE_HOME = previousHome;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------- 导入批次（0.10.1） ----------
+
+test("batch metadata reaches the panel, and rows carry the import date", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "gptfree-gui-batch-"));
+  const previousHome = process.env.MAGPIE_GPTFREE_HOME;
+  process.env.MAGPIE_GPTFREE_HOME = dir;
+
+  const email = "batch-gui@example.com";
+  const batchId = newBatchId(Date.UTC(2026, 10, 18, 2, 54, 0));
+  await recordBatch(
+    { id: batchId, label: "11月采购批", importedAt: "2026-11-18T02:54:00.000Z", count: 1, source: "gui" },
+    { file: join(dir, "batches.json") },
+  );
+
+  const h = await harness({
+    poolRead: async () => [{
+      email, accessToken: future(), totp: seed, password: "p",
+      batchId, addedAt: "2026-11-18T02:54:00.000Z",
+    }],
+    statsStore: createInMemoryStatsStore(),
+  });
+  try {
+    // 静态：批次区块在页面里，前端有对应的渲染入口。
+    assert(h.html.includes('id="liveBatches"'), "运行页要有导入批次区块");
+    assert(h.html.includes('id="liveBatchInfo"'));
+    const appJs = await (await fetch(h.base + "assets/app.js")).text();
+    assert(appJs.includes("renderLiveBatches"));
+    assert(appJs.includes("batchNoteText"));
+
+    const stats = await h.api("stats");
+    assert.equal(stats.status, 200);
+    assert.equal(stats.json.batches.length, 1);
+    assert.equal(stats.json.batches[0].id, batchId);
+    assert.equal(stats.json.batches[0].label, "11月采购批");
+
+    const row = stats.json.accounts[0];
+    assert.equal(row.batchId, batchId);
+    assert.equal(row.addedAt, "2026-11-18T02:54:00.000Z");
+
+    // 运行面板的批次聚合：一个号、成功率还没数据（null 而不是 0）。
+    const dash = await h.api("dashboard");
+    assert.equal(dash.json.batches.length, 1);
+    assert.equal(dash.json.batches[0].accounts, 1);
+    assert.equal(dash.json.batches[0].label, "11月采购批");
+    assert.equal(dash.json.batches[0].successRate, null);
+
+    // 批次元数据里不能夹带邮箱。
+    assert.doesNotMatch(JSON.stringify(stats.json), /batch-gui@example\.com/);
+    assert.doesNotMatch(JSON.stringify(dash.json), /batch-gui@example\.com/);
+  } finally {
+    await h.close();
+    if (previousHome === undefined) delete process.env.MAGPIE_GPTFREE_HOME;
+    else process.env.MAGPIE_GPTFREE_HOME = previousHome;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("an account without batch info falls back to the legacy batch", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "gptfree-gui-legacy-"));
+  const previousHome = process.env.MAGPIE_GPTFREE_HOME;
+  process.env.MAGPIE_GPTFREE_HOME = dir;
+
+  const h = await harness({
+    // 老记录：账号库里没有 batchId / addedAt。
+    poolRead: async () => [
+      { email: "legacy-gui@example.com", accessToken: future(), totp: seed, password: "p" },
+    ],
+    statsStore: createInMemoryStatsStore(),
+  });
+  try {
+    const stats = await h.api("stats");
+    const row = stats.json.accounts[0];
+    assert.equal(row.batchId, "b00000000000000", "没有批次信息就归历史批次");
+    assert.equal(row.addedAt, null, "不能拿 updatedAt 冒充导入时间");
+    assert.equal(stats.json.batches[0].id, "b00000000000000");
+    assert.equal(stats.json.batches[0].importedAt, null);
+  } finally {
+    await h.close();
+    if (previousHome === undefined) delete process.env.MAGPIE_GPTFREE_HOME;
+    else process.env.MAGPIE_GPTFREE_HOME = previousHome;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ── 浏览器 OAuth 登录接口 ────────────────────────────────────────────────────
+// 全部注入假流程：测试进程不监听 1455、不联网、不往 home 写批次。
+function fakeOAuthFlow(captured) {
+  let state = "waiting";
+  let finish;
+  const done = new Promise((resolve) => { finish = resolve; });
+  const flow = {
+    id: "flow-test-1",
+    url: "https://auth.openai.com/oauth/authorize?state=abc&code_challenge=xyz",
+    redirectUri: "http://localhost:1455/auth/callback",
+    callbackListening: true,
+    callbackBlocked: "",
+    status: () => ({ id: flow.id, state, accountLabel: state === "done" ? "o***@example.com" : "", error: "" }),
+    async submitCallback(raw) {
+      if (raw === "bad") {
+        const err = new Error("回调链接与当前授权会话不匹配（state 不一致）");
+        err.status = 400;
+        throw err;
+      }
+      // 真实流程在这一步落库：这里照着做一遍，才能验到 batchId 有没有传对。
+      await captured.save({
+        email: "oauth@example.com", password: "", totp: "",
+        accessToken: future(), refreshToken: "rt_from_oauth",
+      });
+      state = "done";
+      finish({ id: flow.id, state: "done", accountLabel: "o***@example.com" });
+      return flow.status();
+    },
+    wait: (signal) => {
+      // 真流程会响应 abort（取消时立刻收端口）。假流程必须照做，否则
+      // /api/oauth/cancel 会一直挂着把测试进程拖死。
+      if (!signal) return done;
+      if (signal.aborted) {
+        state = "canceled";
+        return Promise.resolve({ id: flow.id, state: "canceled" });
+      }
+      return new Promise((resolve) => {
+        const onAbort = () => {
+          state = "canceled";
+          resolve({ id: flow.id, state: "canceled" });
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        done.then((value) => {
+          signal.removeEventListener("abort", onAbort);
+          resolve(value);
+        });
+      });
+    },
+  };
+  return flow;
+}
+
+test("浏览器登录：起流程 → 轮询状态 → 粘贴回调 → 入池", async () => {
+  const captured = { save: null, flow: null, opened: [] };
+  const h = await harness({
+    poolRead: async () => [],
+    statsStore: createInMemoryStatsStore(),
+    oauthStart: async (options) => {
+      captured.save = options.save;
+      captured.onComplete = options.onComplete;
+      captured.flow = fakeOAuthFlow(captured);
+      return captured.flow;
+    },
+    oauthOpen: (url) => captured.opened.push(url),
+    poolSave: async (record, opts) => { captured.saved = { record, opts }; },
+    probeQuota: async () => ({ ok: true, imageQuota: 3 }),
+  });
+  try {
+    const started = await h.api("oauth/start", { open: true });
+    assert.equal(started.status, 200);
+    assert.match(started.json.url, /^https:\/\/auth\.openai\.com\//);
+    assert.equal(started.json.callbackListening, true);
+    assert.equal(captured.opened.length, 1, "open:true 应该真的去打开浏览器");
+
+    const waiting = await h.api("oauth/status");
+    assert.equal(waiting.json.active, true);
+    assert.equal(waiting.json.state, "waiting");
+
+    const bad = await h.api("oauth/callback", { callback: "bad" });
+    assert.equal(bad.status, 400, "state 不匹配的回调要拒掉");
+    assert.match(bad.json.error || "", /state/);
+
+    const ok = await h.api("oauth/callback", {
+      callback: "http://localhost:1455/auth/callback?code=abc&state=abc",
+    });
+    assert.equal(ok.status, 200);
+    assert.equal(ok.json.state, "done");
+
+    // 落库必须带 batchId，否则新号会被归进「历史批次」。
+    assert.equal(captured.saved.record.email, "oauth@example.com");
+    assert.equal(captured.saved.record.refreshToken, "rt_from_oauth");
+    assert.ok(captured.saved.opts.batchId, "OAuth 入池要单独记一个批次");
+
+    const after = await h.api("oauth/status");
+    assert.equal(after.json.state, "done");
+  } finally {
+    await h.close();
+  }
+});
+
+test("浏览器登录：没有进行中的授权时拒绝回调，取消后状态归零", async () => {
+  const captured = { opened: [] };
+  const h = await harness({
+    poolRead: async () => [],
+    statsStore: createInMemoryStatsStore(),
+    oauthStart: async (options) => {
+      captured.save = options.save;
+      return fakeOAuthFlow(captured);
+    },
+    oauthOpen: (url) => captured.opened.push(url),
+    poolSave: async () => {},
+  });
+  try {
+    const none = await h.api("oauth/callback", { callback: "x" });
+    assert.equal(none.status, 409, "没有流程在跑时不能接回调");
+
+    await h.api("oauth/start", {});
+    assert.equal(captured.opened.length, 0, "没传 open 就不该擅自开浏览器");
+
+    const opened = await h.api("oauth/open", {});
+    assert.equal(opened.status, 200);
+    assert.equal(captured.opened.length, 1);
+
+    const canceled = await h.api("oauth/cancel", {});
+    assert.equal(canceled.status, 200);
+    assert.equal(canceled.json.state, "canceled");
+
+    const idle = await h.api("oauth/status");
+    assert.equal(idle.json.active, false);
+  } finally {
+    await h.close();
+  }
+});
+
+test("OAuth service rejects overlapping starts and stale actions, and cancels on close", async () => {
+  let entered, release;
+  const started = new Promise((r) => { entered = r; });
+  const gate = new Promise((r) => { release = r; });
+  let starts = 0, cancels = 0, opens = 0, submits = 0;
+  const h = await harness({
+    poolRead: async () => [], sessionFile: false,
+    oauthStart: async () => {
+      const id = "flow-" + ++starts;
+      if (starts === 1) { entered(); await gate; }
+      let state = "waiting";
+      let done;
+      const wait = new Promise((r) => { done = r; });
+      const status = () => ({ id, state });
+      return { id, status, url: "https://auth.openai.com/", wait: () => wait,
+        submitCallback: async () => { submits++; return status(); },
+        cancel: () => { cancels++; state = "canceled"; done(status()); return status(); },
+      };
+    },
+    oauthOpen: () => { opens++; },
+  });
+  try {
+    const pending = h.api("oauth/start", {});
+    await started;
+    assert.equal((await h.api("oauth/start", {})).status, 409);
+    release();
+    const first = await pending;
+    assert.equal(first.status, 200);
+    assert.equal((await h.api("oauth/start", {})).status, 409);
+    assert.equal((await h.api("oauth/cancel", { id: first.json.id })).status, 200);
+    const second = await h.api("oauth/start", {});
+    assert.equal(second.status, 200);
+    assert.notEqual(first.json.id, second.json.id);
+    assert.equal((await h.api("oauth/status?id=" + first.json.id)).status, 409);
+    assert.equal((await h.api("oauth/open", { id: first.json.id })).status, 409);
+    assert.equal((await h.api("oauth/callback", { id: first.json.id, callback: "old code" })).status, 409);
+    assert.equal((await h.api("oauth/cancel", { id: first.json.id })).status, 409);
+    assert.equal((await h.api("oauth/status?id=" + second.json.id)).json.state, "waiting");
+    assert.equal(cancels, 1);
+    assert.equal(opens + submits, 0);
+  } finally { release(); await h.close(); }
+  assert.equal(cancels, 2);
+});
+
+test("GUI image quota refresh serializes concurrent requests and ignores force in quota-only mode", async () => {
+  let entered, release;
+  const started = new Promise((r) => { entered = r; });
+  const gate = new Promise((r) => { release = r; });
+  let calls = 0;
+  let passedForce;
+  const h = await harness({
+    poolRead: async () => [{ email: "image-concurrency@example.test", accessToken: future() }],
+    sessionFile: false,
+    refreshAccount: async (_row, opts) => {
+      if (++calls === 1) { passedForce = opts.forceRenew; entered(); await gate; }
+      return { ok: true, status: "valid", quotaOk: true, imageQuota: 0 };
+    },
+  });
+  try {
+    const pending = h.api("accounts/refresh", { all: true, quotaOnly: true, force: true });
+    await started;
+    assert.equal((await h.api("accounts/refresh", { all: true })).status, 409);
+    release();
+    const first = await pending;
+    assert.equal(first.status, 200);
+    assert.equal(first.json.results[0].imageQuota, 0);
+    assert.equal(passedForce, false);
+    assert.equal((await h.api("accounts/refresh", { all: true })).status, 200);
+    assert.equal(calls, 2);
+  } finally { release(); await h.close(); }
+});

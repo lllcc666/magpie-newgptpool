@@ -1,0 +1,74 @@
+{
+  "name": "magpie-newgptpool",
+  "version": "1.0.0",
+  "description": "Magpie GPT 号池：账号导入、文本与生图额度、轮转预设（含分段轮转）",
+  "type": "module",
+  "main": "./index.mjs",
+  "bin": {
+    "magpie-newgptpool": "./bin/import.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "lib",
+    "bin",
+    "README.md",
+    "CHANGELOG.md",
+    "MAINTENANCE.md",
+    "LICENSE",
+    "test",
+    "gui",
+    "python/*.py",
+    "python/*.txt",
+    "python/*.md",
+    "python/utils/*.py"
+  ],
+  "scripts": {
+    "test": "node ./test/run-suite.mjs",
+    "test:python": "python -m unittest discover -s python -p \"test_*.py\" -v",
+    "check": "node --check index.mjs && node --check lib/dsh-http-auth.mjs && node --check lib/chatgpt-web-image.mjs && node --check lib/chatgpt-web-text.mjs && node --check lib/chat-image-bridge.mjs && node --check lib/reply-settings.mjs && node --check lib/image-store.mjs && node --check lib/cleanup-log.mjs && node --check lib/image-error-log.mjs && node --check lib/pool-stats.mjs && node --check lib/request-log.mjs && node --check lib/pool-events.mjs && node --check lib/pool-forecast.mjs && node --check lib/batch-registry.mjs && node --check lib/pool-policy.mjs && node --check lib/pool-weight.mjs && node --check lib/account-inflight.mjs && node --check bin/import.mjs && node --check lib/importer.mjs && node --check lib/credentials.mjs && node --check lib/pool-vault.mjs && node --check lib/codex-pool.mjs && node --check lib/web-oauth.mjs && node --check lib/gui-service.mjs && node --check gui/app.js && node --check gui/entry.js && node --check lib/pool-connection.mjs && node --check lib/native-file-dialog.mjs && node --check lib/provider-native-signin.mjs && node --check lib/text-quota.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {},
+  "keywords": [
+    "magpie",
+    "magpie-plugin",
+    "chatgpt",
+    "chatgpt-web",
+    "account-pool",
+    "gpt-image-2",
+    "image-generation",
+    "batch-import",
+    "totp",
+    "macos"
+  ],
+  "license": "MIT",
+  "magpie": {
+    "name": "GPT 号池",
+    "page": {
+      "title": "GPT 号池",
+      "titles": {
+        "zh": "GPT 号池",
+        "zh-TW": "GPT 帳號池"
+      },
+      "file": "gui/entry.html",
+      "service": {
+        "port": 37991,
+        "option": "port"
+      },
+      "keepAlive": true
+    },
+    "actions": [
+      {
+        "id": "batch-import",
+        "menu": "provider",
+        "title": "打开 GPT 号池",
+        "titles": {
+          "zh": "打开 GPT 号池",
+          "zh-TW": "開啟 GPT 帳號池"
+        }
+      }
+    ]
+  }
+}
